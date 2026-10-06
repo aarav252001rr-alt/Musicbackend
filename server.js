@@ -1,6 +1,6 @@
 // ============================================================
-// 🎵 ECHO MUSIC BACKEND v3.0 — yt-dlp powered
-// Fixes YouTube 403 on Render
+// 🎵 ECHO MUSIC BACKEND v3.1 — yt-dlp powered (Fixed)
+// Deploy-ready for Render.com
 // ============================================================
 
 require('dotenv').config();
@@ -19,16 +19,37 @@ const CACHE_TTL_MS = (parseInt(process.env.CACHE_TTL_MINUTES) || 60) * 60 * 1000
 const CACHE_DIR = path.resolve(process.env.CACHE_DIR || './cache');
 const MAX_CACHE_SIZE = (parseInt(process.env.MAX_CACHE_SIZE_MB) || 400) * 1024 * 1024;
 
-// yt-dlp binary path
-const YTDLP = process.env.YTDLP_PATH
-  || (fs.existsSync(path.join(__dirname, 'bin', 'yt-dlp'))
-        ? path.join(__dirname, 'bin', 'yt-dlp')
-        : 'yt-dlp'); // fallback to system yt-dlp
+// yt-dlp binary resolution
+let YTDLP = process.env.YTDLP_PATH;
+if (!YTDLP) {
+  const localBin = path.join(__dirname, 'bin', 'yt-dlp');
+  YTDLP = fs.existsSync(localBin) ? localBin : 'yt-dlp';
+}
 
-// Cookies file (optional, agar YouTube phir bhi block kare)
 const COOKIES_FILE = process.env.COOKIES_FILE || null;
 
+// Ensure cache dir exists
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+// ==================== VERIFY yt-dlp ====================
+function verifyYtdlp() {
+  try {
+    if (YTDLP !== 'yt-dlp' && fs.existsSync(YTDLP)) {
+      const size = fs.statSync(YTDLP).size;
+      const sizeMB = (size / 1024 / 1024).toFixed(1);
+      console.log(`📦 yt-dlp binary: ${YTDLP} (${sizeMB} MB)`);
+      if (size < 1000000) {
+        console.error('⚠️  yt-dlp binary too small — may be corrupt!');
+        console.error('⚠️  Ensure "npm install" ran the postinstall script.');
+      }
+    } else {
+      console.log(`📦 Using system yt-dlp: ${YTDLP}`);
+    }
+  } catch (e) {
+    console.error('yt-dlp verify error:', e.message);
+  }
+}
+verifyYtdlp();
 
 // ==================== APP ====================
 const app = express();
@@ -41,17 +62,17 @@ app.use('/api/', rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests' }
+  message: { error: 'Too many requests. Slow down!' }
 }));
 
-// ==================== YOUTUBE CLIENT (for metadata only) ====================
+// ==================== YOUTUBE CLIENT (metadata only) ====================
 let ytClient = null;
 async function getClient() {
   if (!ytClient) {
     ytClient = await Innertube.create({
       lang: 'en',
       location: 'IN',
-      retrieve_player: false,  // ⚡ player skip — metadata ke liye
+      retrieve_player: false,
     });
     console.log('✅ YT client ready (metadata)');
   }
@@ -60,14 +81,22 @@ async function getClient() {
 
 // ==================== QUALITY MAP ====================
 const QUALITY_MAP = {
-  'opus-160': { ext: 'opus', label: 'Opus 160kbps', bitrate: 160, mime: 'audio/webm',
-                ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio' },
-  'opus-70':  { ext: 'opus', label: 'Opus 70kbps',  bitrate: 70,  mime: 'audio/webm',
-                ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio' },
-  'm4a-128':  { ext: 'm4a',  label: 'M4A 128kbps',  bitrate: 128, mime: 'audio/mp4',
-                ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio' },
-  'm4a-48':   { ext: 'm4a',  label: 'M4A 48kbps',   bitrate: 48,  mime: 'audio/mp4',
-                ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio' },
+  'opus-160': {
+    ext: 'opus', label: 'Opus 160kbps', bitrate: 160, mime: 'audio/webm',
+    ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio'
+  },
+  'opus-70': {
+    ext: 'opus', label: 'Opus 70kbps', bitrate: 70, mime: 'audio/webm',
+    ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio'
+  },
+  'm4a-128': {
+    ext: 'm4a', label: 'M4A 128kbps', bitrate: 128, mime: 'audio/mp4',
+    ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio'
+  },
+  'm4a-48': {
+    ext: 'm4a', label: 'M4A 48kbps', bitrate: 48, mime: 'audio/mp4',
+    ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio'
+  },
 };
 
 // ==================== CACHE ====================
@@ -79,10 +108,12 @@ function cacheFilePath(videoId, quality) {
 }
 
 function isCacheValid(entry) {
-  return entry && (Date.now() - entry.createdAt) < CACHE_TTL_MS && fs.existsSync(entry.filePath);
+  return entry
+    && (Date.now() - entry.createdAt) < CACHE_TTL_MS
+    && fs.existsSync(entry.filePath);
 }
 
-// In-flight download deduplication (same song simultaneous requests)
+// In-flight deduplication
 const inflightDownloads = new Map();
 
 async function getOrCreateCache(videoId, quality) {
@@ -94,9 +125,8 @@ async function getOrCreateCache(videoId, quality) {
     return { ...existing, fromCache: true };
   }
 
-  // Agar already downloading hai — wait for it
   if (inflightDownloads.has(key)) {
-    console.log(`⏳ Waiting for in-flight download: ${videoId}`);
+    console.log(`⏳ Waiting for in-flight: ${videoId}`);
     return await inflightDownloads.get(key);
   }
 
@@ -116,13 +146,14 @@ async function getOrCreateCache(videoId, quality) {
   return promise;
 }
 
-// ==================== yt-dlp DOWNLOAD ====================
+// ==================== yt-dlp DOWNLOAD (FIXED) ====================
 function downloadWithYtdlp(videoId, quality) {
   return new Promise((resolve, reject) => {
     const q = QUALITY_MAP[quality];
     if (!q) return reject(new Error('Invalid quality'));
 
-    const filePath = cacheFilePath(videoId, quality);
+    const tempTemplate = path.join(CACHE_DIR, `${videoId}_${quality}.%(ext)s`);
+    const expectedFile = cacheFilePath(videoId, quality);
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
     const args = [
@@ -130,18 +161,19 @@ function downloadWithYtdlp(videoId, quality) {
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificates',
-      '--extract-audio',
-      '--audio-format', q.ext === 'opus' ? 'opus' : 'm4a',
-      '--audio-quality', '0',
-      '--output', filePath,
-      '--force-overwrites',
       '--no-part',
-      '--quiet',
+      '--no-mtime',
+      '--prefer-free-formats',
+      '-o', tempTemplate,
       '--print-json',
-      // Android client YouTube 403 se bachne ke liye
-      '--extractor-args', 'youtube:player_client=android,web_safari',
-      // User agent
+      '--quiet',
+      '--extractor-args', 'youtube:player_client=android,web_safari,ios',
       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--geo-bypass',
+      '--geo-bypass-country', 'IN',
+      '--socket-timeout', '30',
+      '--retries', '3',
+      '--fragment-retries', '3'
     ];
 
     if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
@@ -153,58 +185,88 @@ function downloadWithYtdlp(videoId, quality) {
     let stdout = '';
     let stderr = '';
 
-    const proc = spawn(YTDLP, args, { timeout: 120000 });
+    const proc = spawn(YTDLP, args, { timeout: 180000 });
 
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.stderr.on('data', (d) => {
+      stderr += d.toString();
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[yt-dlp]', d.toString().trim());
+      }
+    });
 
-    proc.on('close', async (code) => {
+    proc.on('close', (code) => {
       if (code !== 0) {
-        console.error('yt-dlp failed:', stderr.slice(-500));
-        // Cleanup partial file
-        try { fs.unlinkSync(filePath); } catch {}
-        return reject(new Error(`yt-dlp failed (${code}): ${stderr.slice(-200)}`));
+        console.error('❌ yt-dlp failed:', stderr.slice(-1000));
+        try {
+          for (const f of fs.readdirSync(CACHE_DIR)) {
+            if (f.startsWith(`${videoId}_${quality}`)) {
+              fs.unlinkSync(path.join(CACHE_DIR, f));
+            }
+          }
+        } catch {}
+        return reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-300)}`));
       }
 
-      if (!fs.existsSync(filePath)) {
-        // Try alternate path (yt-dlp sometimes adds ext)
-        const dir = path.dirname(filePath);
-        const base = path.basename(filePath, path.extname(filePath));
-        const alt = fs.readdirSync(dir).find(f => f.startsWith(base));
-        if (alt) {
-          fs.renameSync(path.join(dir, alt), filePath);
-        } else {
-          return reject(new Error('Output file not found after download'));
+      // Find actual downloaded file
+      let actualFile = null;
+      try {
+        const files = fs.readdirSync(CACHE_DIR);
+        const match = files.find(f => f.startsWith(`${videoId}_${quality}`));
+        if (match) actualFile = path.join(CACHE_DIR, match);
+      } catch (e) {
+        return reject(new Error(`Failed to list cache dir: ${e.message}`));
+      }
+
+      if (!actualFile || !fs.existsSync(actualFile)) {
+        return reject(new Error('Output file not found after download'));
+      }
+
+      // Rename to canonical path
+      if (actualFile !== expectedFile) {
+        try {
+          if (fs.existsSync(expectedFile)) fs.unlinkSync(expectedFile);
+          fs.renameSync(actualFile, expectedFile);
+        } catch (e) {
+          console.warn('Rename failed, using actual file:', e.message);
         }
       }
 
-      // Parse JSON metadata
+      const finalPath = fs.existsSync(expectedFile) ? expectedFile : actualFile;
+      const stats = fs.statSync(finalPath);
+
+      // Parse metadata
       let meta = {};
       try {
-        const jsonLine = stdout.trim().split('\n').pop();
-        meta = JSON.parse(jsonLine);
-      } catch {}
+        const lines = stdout.trim().split('\n').filter(Boolean);
+        meta = JSON.parse(lines[lines.length - 1]);
+      } catch (e) {
+        console.warn('Failed to parse yt-dlp JSON:', e.message);
+      }
 
-      const stats = fs.statSync(filePath);
+      const actualExt = path.extname(finalPath).replace('.', '') || q.ext;
+      const mime = (actualExt === 'opus' || actualExt === 'webm')
+        ? 'audio/webm'
+        : 'audio/mp4';
 
       resolve({
         videoId,
         quality,
-        filePath,
+        filePath: finalPath,
         createdAt: Date.now(),
         size: stats.size,
         title: meta.title || 'Unknown',
         artist: meta.uploader || meta.channel || 'Unknown',
         duration: meta.duration || 0,
         thumbnail: meta.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        mime: q.mime,
-        ext: q.ext
+        mime,
+        ext: actualExt
       });
     });
 
     proc.on('error', (err) => {
       if (err.code === 'ENOENT') {
-        return reject(new Error('yt-dlp binary not found. Check bin/ folder or YTDLP_PATH env.'));
+        return reject(new Error(`yt-dlp binary not found at ${YTDLP}`));
       }
       reject(err);
     });
@@ -279,7 +341,7 @@ function formatSongItem(item) {
   };
 }
 
-// ==================== MUSIC FUNCTIONS (metadata) ====================
+// ==================== MUSIC FUNCTIONS ====================
 async function searchMusic(query, limit = 20) {
   const yt = await getClient();
   const results = await yt.music.search(query, { type: 'song' });
@@ -293,17 +355,24 @@ async function searchAll(query) {
     songs: (r.songs?.contents || []).slice(0, 15).map(formatSongItem).filter(Boolean),
     videos: (r.videos?.contents || []).slice(0, 10).map(formatSongItem).filter(Boolean),
     albums: (r.albums?.contents || []).slice(0, 10).map(a => ({
-      browseId: a.id, title: a.title,
+      browseId: a.id,
+      title: a.title,
       artist: a.artists?.map(x => x.name).join(', ') || '',
-      year: a.year, thumbnail: a.thumbnail?.[0]?.url
+      year: a.year,
+      thumbnail: a.thumbnail?.[0]?.url
     })),
     artists: (r.artists?.contents || []).slice(0, 10).map(a => ({
-      browseId: a.id, name: a.name,
-      subscribers: a.subscribers?.text, thumbnail: a.thumbnail?.[0]?.url
+      browseId: a.id,
+      name: a.name,
+      subscribers: a.subscribers?.text,
+      thumbnail: a.thumbnail?.[0]?.url
     })),
     playlists: (r.playlists?.contents || []).slice(0, 10).map(p => ({
-      browseId: p.id, title: p.title, author: p.author?.name,
-      itemCount: p.item_count, thumbnail: p.thumbnail?.[0]?.url
+      browseId: p.id,
+      title: p.title,
+      author: p.author?.name,
+      itemCount: p.item_count,
+      thumbnail: p.thumbnail?.[0]?.url
     }))
   };
 }
@@ -336,6 +405,26 @@ async function getHomePage() {
   return result.slice(0, 10);
 }
 
+async function getNewReleases() {
+  const yt = await getClient();
+  try {
+    const home = await yt.music.getHomeFeed();
+    const sections = home.sections || [];
+    const result = [];
+    for (const s of sections) {
+      const title = s.header?.title?.text || '';
+      const lower = title.toLowerCase();
+      if (lower.includes('new') || lower.includes('release') || lower.includes('fresh')) {
+        const items = (s.contents || []).slice(0, 15).map(formatSongItem).filter(Boolean);
+        if (items.length) result.push({ section: title, items });
+      }
+    }
+    return result;
+  } catch {
+    return [];
+  }
+}
+
 async function getLyrics(videoId) {
   const yt = await getClient();
   try {
@@ -351,21 +440,77 @@ async function getLyrics(videoId) {
       }).filter(l => l.text);
       return { available: true, synced: true, lines: parsed };
     }
+
     return {
-      available: true, synced: false,
-      lines: lyrics.text?.split('\n').filter(l => l.trim()).map(t => ({ time: null, text: t })) || []
+      available: true,
+      synced: false,
+      lines: (lyrics.text || '')
+        .split('\n')
+        .filter(l => l.trim())
+        .map(t => ({ time: null, text: t }))
     };
   } catch (e) {
     return { available: false, error: e.message };
   }
 }
 
-// ==================== USER PLAYLISTS ====================
+async function getArtist(browseId) {
+  const yt = await getClient();
+  const artist = await yt.music.getArtist(browseId);
+  return {
+    name: artist.header?.title?.text || '',
+    description: artist.description,
+    thumbnail: artist.header?.thumbnail?.contents?.[0]?.url
+      || artist.header?.thumbnail?.[0]?.url,
+    subscribers: artist.header?.subscriber_count?.text,
+    songs: (artist.songs?.contents || []).slice(0, 20).map(formatSongItem).filter(Boolean),
+    albums: (artist.albums?.contents || []).slice(0, 20).map(a => ({
+      browseId: a.id,
+      title: a.title,
+      year: a.year,
+      thumbnail: a.thumbnail?.[0]?.url
+    }))
+  };
+}
+
+async function getAlbum(browseId) {
+  const yt = await getClient();
+  const album = await yt.music.getAlbum(browseId);
+  return {
+    title: album.header?.title?.text || '',
+    artist: album.header?.subtitle?.text || '',
+    year: album.header?.second_subtitle?.text || '',
+    thumbnail: album.header?.thumbnail?.contents?.[0]?.url
+      || album.header?.thumbnail?.[0]?.url,
+    tracks: (album.contents || []).slice(0, 50).map(formatSongItem).filter(Boolean)
+  };
+}
+
+async function getPlaylistInfo(browseId, limit = 100) {
+  const yt = await getClient();
+  const playlist = await yt.music.getPlaylist(browseId);
+  return {
+    title: playlist.header?.title?.text || '',
+    author: playlist.header?.author?.name || '',
+    description: playlist.header?.description?.text || '',
+    thumbnail: playlist.header?.thumbnail?.contents?.[0]?.url
+      || playlist.header?.thumbnail?.[0]?.url,
+    itemCount: playlist.header?.item_count?.text || '',
+    tracks: (playlist.items || []).slice(0, limit).map(item => {
+      if (item.item_type === 'song' || item.item_type === 'video') return formatSongItem(item);
+      return null;
+    }).filter(Boolean)
+  };
+}
+
+// ==================== USER PLAYLISTS (in-memory) ====================
 const userPlaylists = new Map();
+
 function getUserPlaylists(userId = 'default') {
   if (!userPlaylists.has(userId)) userPlaylists.set(userId, new Map());
   return userPlaylists.get(userId);
 }
+
 function createPlaylist(userId, name) {
   const pls = getUserPlaylists(userId);
   const id = crypto.randomBytes(8).toString('hex');
@@ -377,24 +522,59 @@ function createPlaylist(userId, name) {
 // ==================== ROUTES ====================
 
 app.get('/health', (req, res) => {
+  let ytdlpOk = YTDLP === 'yt-dlp';
+  let ytdlpSize = 0;
+  try {
+    if (fs.existsSync(YTDLP)) {
+      ytdlpSize = fs.statSync(YTDLP).size;
+      ytdlpOk = ytdlpSize > 1000000;
+    }
+  } catch {}
+
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     cache: cacheMeta.size,
     ytdlp: YTDLP,
-    ytdlpExists: fs.existsSync(YTDLP) || YTDLP === 'yt-dlp'
+    ytdlpExists: fs.existsSync(YTDLP) || YTDLP === 'yt-dlp',
+    ytdlpSizeMB: +(ytdlpSize / 1024 / 1024).toFixed(1),
+    ytdlpOk
   });
 });
 
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    name: '🎵 Echo Music API v3',
-    version: '3.0.0',
-    cache: { entries: cacheMeta.size, ttl: `${CACHE_TTL_MS / 60000} min` }
+    name: '🎵 Echo Music API',
+    version: '3.1.0',
+    cache: { entries: cacheMeta.size, ttl: `${CACHE_TTL_MS / 60000} min` },
+    endpoints: {
+      search: 'GET /api/search?q=song&limit=20',
+      searchAll: 'GET /api/search/all?q=song',
+      home: 'GET /api/home',
+      trending: 'GET /api/trending?region=IN',
+      newReleases: 'GET /api/new',
+      related: 'GET /api/related/:videoId',
+      lyrics: 'GET /api/lyrics/:videoId',
+      artist: 'GET /api/artist/:browseId',
+      album: 'GET /api/album/:browseId',
+      playlistInfo: 'GET /api/playlist/:browseId',
+      streamInfo: 'GET /api/stream-info/:videoId?quality=m4a-128',
+      stream: 'GET /api/stream/:videoId?quality=m4a-128',
+      download: 'GET /api/download/:videoId?quality=m4a-128',
+      qualities: 'GET /api/qualities',
+      testYtdlp: 'GET /api/test-ytdlp',
+      cacheStats: 'GET /api/cache/stats',
+      userPlaylists: 'GET /api/user/playlists',
+      createPlaylist: 'POST /api/user/playlists {name}',
+      addToPlaylist: 'POST /api/user/playlists/:id/add {videoId}',
+      removeFromPlaylist: 'DELETE /api/user/playlists/:id/:videoId',
+      deletePlaylist: 'DELETE /api/user/playlists/:id'
+    }
   });
 });
 
+// Qualities list
 app.get('/api/qualities', (req, res) => {
   res.json({
     success: true,
@@ -404,11 +584,29 @@ app.get('/api/qualities', (req, res) => {
   });
 });
 
-// Test yt-dlp availability
+// yt-dlp test
 app.get('/api/test-ytdlp', (req, res) => {
-  execFile(YTDLP, ['--version'], (err, stdout, stderr) => {
-    if (err) return res.status(500).json({ ok: false, error: err.message, stderr });
-    res.json({ ok: true, version: stdout.trim(), path: YTDLP });
+  execFile(YTDLP, ['--version'], { timeout: 10000 }, (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({
+        ok: false,
+        path: YTDLP,
+        error: err.message,
+        stderr: stderr?.slice(-300),
+        exists: fs.existsSync(YTDLP),
+        sizeMB: fs.existsSync(YTDLP)
+          ? +(fs.statSync(YTDLP).size / 1024 / 1024).toFixed(1)
+          : 0
+      });
+    }
+    res.json({
+      ok: true,
+      version: stdout.trim(),
+      path: YTDLP,
+      sizeMB: fs.existsSync(YTDLP)
+        ? +(fs.statSync(YTDLP).size / 1024 / 1024).toFixed(1)
+        : 0
+    });
   });
 });
 
@@ -435,11 +633,13 @@ app.get('/api/search/all', async (req, res) => {
   }
 });
 
+// HOME
 app.get('/api/home', async (req, res) => {
   try { res.json({ success: true, sections: await getHomePage() }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// TRENDING
 app.get('/api/trending', async (req, res) => {
   try {
     const { region = 'IN' } = req.query;
@@ -448,6 +648,13 @@ app.get('/api/trending', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// NEW RELEASES
+app.get('/api/new', async (req, res) => {
+  try { res.json({ success: true, sections: await getNewReleases() }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// RELATED
 app.get('/api/related/:videoId', async (req, res) => {
   try {
     const results = await getRelated(req.params.videoId);
@@ -455,6 +662,7 @@ app.get('/api/related/:videoId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// LYRICS
 app.get('/api/lyrics/:videoId', async (req, res) => {
   try {
     const lyrics = await getLyrics(req.params.videoId);
@@ -462,7 +670,25 @@ app.get('/api/lyrics/:videoId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ==================== STREAM (yt-dlp cache) ====================
+// ARTIST
+app.get('/api/artist/:browseId', async (req, res) => {
+  try { res.json({ success: true, ...(await getArtist(req.params.browseId)) }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ALBUM
+app.get('/api/album/:browseId', async (req, res) => {
+  try { res.json({ success: true, ...(await getAlbum(req.params.browseId)) }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// YOUTUBE PLAYLIST INFO
+app.get('/api/playlist/:browseId', async (req, res) => {
+  try { res.json({ success: true, ...(await getPlaylistInfo(req.params.browseId)) }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==================== STREAM & DOWNLOAD ====================
 
 app.get('/api/stream-info/:videoId', async (req, res) => {
   try {
@@ -489,7 +715,9 @@ app.get('/api/stream-info/:videoId', async (req, res) => {
       thumbnail: entry.thumbnail,
       quality,
       format: {
-        ext: entry.ext, mime: entry.mime, size: entry.size,
+        ext: entry.ext,
+        mime: entry.mime,
+        size: entry.size,
         bitrate: QUALITY_MAP[quality].bitrate
       },
       streamUrl: `${proto}://${host}/api/stream/${videoId}?quality=${quality}`,
@@ -521,6 +749,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('X-Cache', entry.fromCache ? 'HIT' : 'MISS');
+    res.setHeader('X-Expires-At', new Date(entry.createdAt + CACHE_TTL_MS).toISOString());
 
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-');
@@ -562,6 +791,7 @@ app.get('/api/download/:videoId', async (req, res) => {
 });
 
 // ==================== USER PLAYLISTS ====================
+
 app.get('/api/user/playlists', (req, res) => {
   const userId = req.headers['x-user-id'] || 'default';
   res.json({ success: true, playlists: [...getUserPlaylists(userId).values()] });
@@ -601,6 +831,7 @@ app.delete('/api/user/playlists/:id', (req, res) => {
 });
 
 // ==================== CACHE ADMIN ====================
+
 app.get('/api/cache/stats', (req, res) => {
   let totalSize = 0;
   for (const e of cacheMeta.values()) totalSize += e.size || 0;
@@ -609,8 +840,12 @@ app.get('/api/cache/stats', (req, res) => {
     entries: cacheMeta.size,
     totalSizeMB: +(totalSize / 1024 / 1024).toFixed(2),
     ttlMinutes: CACHE_TTL_MS / 60000,
+    maxCacheMB: +(MAX_CACHE_SIZE / 1024 / 1024).toFixed(0),
     items: [...cacheMeta.entries()].map(([k, e]) => ({
-      key: k, videoId: e.videoId, quality: e.quality,
+      key: k,
+      videoId: e.videoId,
+      quality: e.quality,
+      title: e.title,
       sizeMB: +(e.size / 1024 / 1024).toFixed(2),
       ageMinutes: +((Date.now() - e.createdAt) / 60000).toFixed(1),
       expiresIn: Math.max(0, Math.round((e.createdAt + CACHE_TTL_MS - Date.now()) / 60000))
@@ -637,14 +872,25 @@ app.use((err, req, res, next) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('============================================');
-  console.log(`🎵 Echo Music API v3.0 (yt-dlp)`);
+  console.log(`🎵 Echo Music API v3.1`);
   console.log(`🌐 http://0.0.0.0:${PORT}`);
   console.log(`📁 Cache: ${CACHE_DIR}`);
   console.log(`🎬 yt-dlp: ${YTDLP}`);
   console.log(`⏱️  TTL: ${CACHE_TTL_MS / 60000} min`);
+  console.log(`💾 Max cache: ${(MAX_CACHE_SIZE / 1024 / 1024).toFixed(0)} MB`);
   console.log('============================================');
 });
 
+// Graceful shutdown
 process.on('SIGTERM', () => {
+  console.log('SIGTERM received, cleaning up...');
   cleanupExpiredCache().finally(() => process.exit(0));
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
 });
