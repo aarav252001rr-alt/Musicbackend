@@ -1,7 +1,6 @@
 // ============================================================
-// 🎵 ECHO MUSIC BACKEND v3.4 — Multi-Client Rotation
-// yt-dlp + Cookies + Smart Client Fallback
-// Deploy-ready for Render.com
+// 🎵 ECHO MUSIC BACKEND v3.7 — Fast + Robust
+// Fixed yt-dlp + Fresh cookies + Parallel processing
 // ============================================================
 
 require('dotenv').config();
@@ -20,7 +19,9 @@ const CACHE_TTL_MS = (parseInt(process.env.CACHE_TTL_MINUTES) || 60) * 60 * 1000
 const CACHE_DIR = path.resolve(process.env.CACHE_DIR || './cache');
 const MAX_CACHE_SIZE = (parseInt(process.env.MAX_CACHE_SIZE_MB) || 400) * 1024 * 1024;
 
-// yt-dlp binary
+const CLIENT_TIMEOUT_MS = 7000;
+const PARALLEL_CLIENTS = 4;
+
 let YTDLP = process.env.YTDLP_PATH;
 if (!YTDLP) {
   const localBin = path.join(__dirname, 'bin', 'yt-dlp');
@@ -29,7 +30,33 @@ if (!YTDLP) {
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// ==================== COOKIES SETUP ====================
+// ==================== yt-dlp VERIFY ====================
+function verifyYtdlp() {
+  return new Promise((resolve) => {
+    execFile(YTDLP, ['--version'], { timeout: 10000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`❌ yt-dlp FAILED: ${err.message}`);
+        console.error(`   Path: ${YTDLP}`);
+        console.error(`   Exists: ${fs.existsSync(YTDLP)}`);
+        if (fs.existsSync(YTDLP)) {
+          console.error(`   Size: ${(fs.statSync(YTDLP).size / 1024 / 1024).toFixed(2)} MB`);
+        }
+        return resolve({ ok: false, error: err.message });
+      }
+      const version = stdout.trim();
+      const size = fs.existsSync(YTDLP) ? fs.statSync(YTDLP).size : 0;
+      console.log(`🎬 yt-dlp: v${version} (${(size / 1024 / 1024).toFixed(1)} MB)`);
+      
+      if (size < 15 * 1024 * 1024) {
+        console.warn(`⚠️  yt-dlp binary is too small (${(size / 1024 / 1024).toFixed(1)} MB). Real binary is ~30 MB.`);
+        console.warn(`⚠️  This is likely a corrupt/launcher script — download yt-dlp_linux instead.`);
+      }
+      resolve({ ok: true, version, size });
+    });
+  });
+}
+
+// ==================== COOKIES ====================
 let COOKIES_FILE = null;
 
 function setupCookies() {
@@ -40,108 +67,95 @@ function setupCookies() {
       fs.writeFileSync(cookiesPath, content, { mode: 0o600 });
       COOKIES_FILE = cookiesPath;
       const lines = content.split('\n').filter(l => l.trim() && !l.startsWith('#'));
-      console.log(`🍪 Cookies loaded from ENV (${lines.length} entries)`);
+      console.log(`🍪 Cookies loaded (${lines.length} entries)`);
       return;
     } catch (e) {
-      console.error('❌ Failed to decode YTDLP_COOKIES_B64:', e.message);
+      console.error('❌ Cookie decode failed:', e.message);
     }
   }
-
   if (process.env.COOKIES_FILE && fs.existsSync(process.env.COOKIES_FILE)) {
     COOKIES_FILE = process.env.COOKIES_FILE;
     const count = fs.readFileSync(COOKIES_FILE, 'utf-8')
       .split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
-    console.log(`🍪 Cookies from env path: ${COOKIES_FILE} (${count} entries)`);
+    console.log(`🍪 Cookies: ${COOKIES_FILE} (${count} entries)`);
     return;
   }
-
   const localCookies = path.join(__dirname, 'cookies', 'cookies.txt');
   if (fs.existsSync(localCookies)) {
     COOKIES_FILE = localCookies;
-    const count = fs.readFileSync(localCookies, 'utf-8')
-      .split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
-    console.log(`🍪 Cookies from local: ${localCookies} (${count} entries)`);
+    console.log(`🍪 Cookies: ${localCookies}`);
     return;
   }
-
-  console.warn('⚠️  NO COOKIES FOUND — YouTube may block requests');
+  console.warn('⚠️  NO COOKIES');
 }
-
 setupCookies();
-
-// ==================== VERIFY yt-dlp ====================
-function verifyYtdlp() {
-  try {
-    if (YTDLP !== 'yt-dlp' && fs.existsSync(YTDLP)) {
-      const size = fs.statSync(YTDLP).size;
-      console.log(`📦 yt-dlp: ${YTDLP} (${(size / 1024 / 1024).toFixed(1)} MB)`);
-    } else {
-      console.log(`📦 System yt-dlp: ${YTDLP}`);
-    }
-  } catch (e) {
-    console.error('yt-dlp verify error:', e.message);
-  }
-}
-verifyYtdlp();
 
 // ==================== APP ====================
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
-
 app.use('/api/', rateLimit({
   windowMs: 60 * 1000,
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests. Slow down!' }
+  message: { error: 'Too many requests' }
 }));
 
-// ==================== YOUTUBE CLIENT (metadata) ====================
+// ==================== YT CLIENT (pre-init) ====================
 let ytClient = null;
+let ytClientPromise = null;
+
 async function getClient() {
-  if (!ytClient) {
-    ytClient = await Innertube.create({
-      lang: 'en',
-      location: 'IN',
-      retrieve_player: false,
-    });
-    console.log('✅ YT client ready (metadata)');
-  }
-  return ytClient;
+  if (ytClient) return ytClient;
+  if (ytClientPromise) return ytClientPromise;
+  ytClientPromise = Innertube.create({
+    lang: 'en',
+    location: 'IN',
+    retrieve_player: false,
+    enable_session_cache: true,
+  }).then(client => {
+    ytClient = client;
+    console.log('✅ YT client ready');
+    return client;
+  });
+  return ytClientPromise;
 }
+
+// ⚡ Pre-init
+getClient().catch(e => console.error('YT init failed:', e.message));
 
 // ==================== QUALITY MAP ====================
 const QUALITY_MAP = {
   'opus-160': {
     ext: 'opus', label: 'Opus 160kbps', bitrate: 160, mime: 'audio/webm',
-    ytdlpFormat: 'bestaudio[acodec=opus][abr>=128]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio'
+    ytdlpFormat: 'bestaudio[acodec=opus][abr>=128]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/ba'
   },
   'opus-70': {
     ext: 'opus', label: 'Opus 70kbps', bitrate: 70, mime: 'audio/webm',
-    ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio'
+    ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/ba'
   },
   'm4a-128': {
     ext: 'm4a', label: 'M4A 128kbps', bitrate: 128, mime: 'audio/mp4',
-    ytdlpFormat: 'bestaudio[ext=m4a][abr>=96]/bestaudio[acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio'
+    ytdlpFormat: 'bestaudio[ext=m4a][abr>=96]/bestaudio[acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/ba'
   },
   'm4a-48': {
     ext: 'm4a', label: 'M4A 48kbps', bitrate: 48, mime: 'audio/mp4',
-    ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[acodec=opus]/bestaudio'
+    ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[acodec=opus]/bestaudio/ba'
   },
 };
 
-// ==================== PLAYER CLIENTS (rotation list) ====================
+// ⚡ FASTEST first (most likely to work)
 const PLAYER_CLIENTS = [
-  'tv_embedded',   // best for music
-  'android_vr',    // no PO token needed
+  'android_vr',
   'ios',
+  'tv_embedded',
+  'web_music',
   'android',
-  'tv',
-  'web_music',     // YouTube Music
-  'web_safari',
   'mweb',
+  'tv',
+  'web_safari',
   'web_embedded',
   'web'
 ];
@@ -167,16 +181,16 @@ async function getOrCreateCache(videoId, quality) {
   const existing = cacheMeta.get(key);
 
   if (isCacheValid(existing)) {
-    console.log(`♻️  CACHE HIT: ${videoId} (${quality})`);
+    console.log(`♻️  HIT: ${videoId}`);
     return { ...existing, fromCache: true };
   }
 
   if (inflightDownloads.has(key)) {
-    console.log(`⏳ Waiting for in-flight: ${videoId}`);
+    console.log(`⏳ Wait: ${videoId}`);
     return await inflightDownloads.get(key);
   }
 
-  console.log(`⬇️  Downloading: ${videoId} (${quality})`);
+  console.log(`⬇️  Download: ${videoId} (${quality})`);
   const promise = downloadWithYtdlp(videoId, quality)
     .then((entry) => {
       cacheMeta.set(key, entry);
@@ -192,43 +206,61 @@ async function getOrCreateCache(videoId, quality) {
   return promise;
 }
 
-// ==================== yt-dlp DOWNLOAD (Multi-Client Rotation) ====================
+// ==================== ⚡ FAST PARALLEL DOWNLOAD ====================
 async function downloadWithYtdlp(videoId, quality) {
   const q = QUALITY_MAP[quality];
   if (!q) throw new Error('Invalid quality');
 
-  const errors = [];
+  const firstBatch = PLAYER_CLIENTS.slice(0, PARALLEL_CLIENTS);
+  const remaining = PLAYER_CLIENTS.slice(PARALLEL_CLIENTS);
 
-  for (const client of PLAYER_CLIENTS) {
+  console.log(`🚀 Parallel: ${firstBatch.join(', ')}`);
+
+  // ⚡ Parallel race — pehle jo succeed kare
+  const parallelResults = await Promise.allSettled(
+    firstBatch.map(client => tryDownloadWithClient(videoId, quality, client))
+  );
+
+  const winner = parallelResults.find(r => r.status === 'fulfilled');
+  if (winner) return winner.value;
+
+  // ⚡ Sequential fallback
+  console.log(`⚠️  Parallel failed, trying ${remaining.length} more...`);
+  const errors = parallelResults.map((r, i) => 
+    `[${firstBatch[i]}] ${(r.reason?.message || '').slice(0, 100)}`
+  );
+
+  for (const client of remaining) {
     try {
-      console.log(`🎯 Trying client: ${client}`);
-      const result = await tryDownloadWithClient(videoId, quality, client);
-      console.log(`✅ Success with client: ${client}`);
-      return result;
+      console.log(`🎯 ${client}`);
+      return await tryDownloadWithClient(videoId, quality, client);
     } catch (err) {
-      const shortErr = err.message.split('\n')[0].slice(0, 150);
+      const shortErr = err.message.split('\n')[0].slice(0, 100);
       console.log(`❌ ${client}: ${shortErr}`);
       errors.push(`[${client}] ${shortErr}`);
-
-      // Cleanup partial files
-      try {
-        for (const f of fs.readdirSync(CACHE_DIR)) {
-          if (f.startsWith(`${videoId}_${quality}`)) {
-            fs.unlinkSync(path.join(CACHE_DIR, f));
-          }
-        }
-      } catch {}
+      cleanupPartial(videoId, quality);
     }
   }
 
   throw new Error(`All ${PLAYER_CLIENTS.length} clients failed:\n${errors.join('\n')}`);
 }
 
-// ==================== Single Client Download ====================
+function cleanupPartial(videoId, quality) {
+  try {
+    for (const f of fs.readdirSync(CACHE_DIR)) {
+      if (f.startsWith(`${videoId}_${quality}`)) {
+        try { fs.unlinkSync(path.join(CACHE_DIR, f)); } catch {}
+      }
+    }
+  } catch {}
+}
+
+// ==================== Single Client Attempt ====================
 function tryDownloadWithClient(videoId, quality, client) {
   return new Promise((resolve, reject) => {
     const q = QUALITY_MAP[quality];
-    const tempTemplate = path.join(CACHE_DIR, `${videoId}_${quality}.%(ext)s`);
+    const uniqueId = `${videoId}_${quality}_${client}_${Date.now()}`;
+    const tempTemplate = path.join(CACHE_DIR, `${uniqueId}.%(ext)s`);
     const expectedFile = cacheFilePath(videoId, quality);
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
@@ -248,9 +280,11 @@ function tryDownloadWithClient(videoId, quality, client) {
       '--add-header', 'Accept-Language:en-US,en;q=0.9',
       '--geo-bypass',
       '--geo-bypass-country', 'IN',
-      '--socket-timeout', '30',
-      '--retries', '2',
-      '--fragment-retries', '2'
+      '--socket-timeout', '5',
+      '--retries', '0',
+      '--fragment-retries', '0',
+      '--no-check-formats',
+      '--no-cache-dir'
     ];
 
     if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
@@ -261,56 +295,66 @@ function tryDownloadWithClient(videoId, quality, client) {
 
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
 
-    const proc = spawn(YTDLP, args, { timeout: 90000 });
+    const proc = spawn(YTDLP, args);
+
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      try { proc.kill('SIGKILL'); } catch {}
+    }, CLIENT_TIMEOUT_MS);
 
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
     proc.on('close', (code) => {
-      if (code !== 0) {
-        return reject(new Error(stderr.slice(-400) || `exit code ${code}`));
+      clearTimeout(killTimer);
+
+      if (timedOut) {
+        cleanupUnique(uniqueId);
+        return reject(new Error(`Timeout ${CLIENT_TIMEOUT_MS}ms`));
       }
 
+      if (code !== 0) {
+        cleanupUnique(uniqueId);
+        return reject(new Error(stderr.slice(-250) || `exit ${code}`));
+      }
+
+      // Find file
       let actualFile = null;
       try {
         const files = fs.readdirSync(CACHE_DIR);
-        const match = files.find(f =>
-          f.startsWith(`${videoId}_${quality}`)
-          && !f.endsWith('.txt')
-          && !f.endsWith('.json')
-          && !f.endsWith('.part')
-          && !f.endsWith('.ytdl')
-        );
+        const match = files.find(f => f.startsWith(uniqueId));
         if (match) actualFile = path.join(CACHE_DIR, match);
       } catch (e) {
-        return reject(new Error(`List dir failed: ${e.message}`));
+        return reject(new Error(`List failed: ${e.message}`));
       }
 
       if (!actualFile || !fs.existsSync(actualFile)) {
-        return reject(new Error('Output file not found after download'));
+        return reject(new Error('Output not found'));
       }
 
       const stats = fs.statSync(actualFile);
       if (stats.size < 10000) {
         try { fs.unlinkSync(actualFile); } catch {}
-        return reject(new Error(`File too small: ${stats.size} bytes`));
+        return reject(new Error(`File too small: ${stats.size}B`));
       }
 
-      // Rename to canonical path
-      if (actualFile !== expectedFile) {
-        try {
-          if (fs.existsSync(expectedFile)) fs.unlinkSync(expectedFile);
-          fs.renameSync(actualFile, expectedFile);
-        } catch (e) {
-          console.warn('Rename failed:', e.message);
+      // Move to canonical
+      try {
+        if (fs.existsSync(expectedFile)) {
+          try { fs.unlinkSync(expectedFile); } catch {}
         }
+        fs.renameSync(actualFile, expectedFile);
+      } catch (e) {
+        try { fs.unlinkSync(expectedFile); } catch {}
+        try { fs.renameSync(actualFile, expectedFile); } catch {}
       }
 
       const finalPath = fs.existsSync(expectedFile) ? expectedFile : actualFile;
       const finalStats = fs.statSync(finalPath);
 
-      // Parse metadata JSON
+      // Metadata
       let meta = {};
       try {
         const lines = stdout.trim().split('\n').filter(Boolean);
@@ -320,17 +364,16 @@ function tryDownloadWithClient(videoId, quality, client) {
             if (parsed && parsed.title) { meta = parsed; break; }
           } catch {}
         }
-      } catch (e) {}
+      } catch {}
 
       const actualExt = path.extname(finalPath).replace('.', '').toLowerCase() || q.ext;
       const isWebm = actualExt === 'opus' || actualExt === 'webm';
       const mime = isWebm ? 'audio/webm' : 'audio/mp4';
 
-      console.log(`✅ Downloaded: ${actualExt} (${(finalStats.size / 1024).toFixed(0)} KB) via ${client}`);
+      console.log(`✅ ${client} → ${actualExt} (${(finalStats.size / 1024).toFixed(0)}KB)`);
 
       resolve({
-        videoId,
-        quality,
+        videoId, quality,
         filePath: finalPath,
         createdAt: Date.now(),
         size: finalStats.size,
@@ -338,65 +381,26 @@ function tryDownloadWithClient(videoId, quality, client) {
         artist: meta.uploader || meta.channel || 'Unknown',
         duration: meta.duration || 0,
         thumbnail: meta.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        mime,
-        ext: actualExt,
-        client
+        mime, ext: actualExt, client
       });
     });
 
     proc.on('error', (err) => {
-      if (err.code === 'ENOENT') {
-        return reject(new Error(`yt-dlp not found at ${YTDLP}`));
-      }
-      reject(err);
+      clearTimeout(killTimer);
+      cleanupUnique(uniqueId);
+      reject(err.code === 'ENOENT' ? new Error(`yt-dlp not found: ${YTDLP}`) : err);
     });
   });
 }
 
-// ==================== DEBUG: Test single client ====================
-function testClient(videoId, client) {
-  return new Promise((resolve) => {
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    const args = [
-      '--list-formats',
-      '--no-warnings',
-      '--no-check-certificates',
-      '--extractor-args', `youtube:player_client=${client}`,
-      '--geo-bypass',
-      '--geo-bypass-country', 'IN',
-      '--socket-timeout', '20'
-    ];
-    if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
-      args.push('--cookies', COOKIES_FILE);
-    }
-    args.push(videoUrl);
-
-    execFile(YTDLP, args, { timeout: 25000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        return resolve({
-          ok: false,
-          error: err.message.split('\n')[0].slice(0, 200),
-          stderr: stderr?.slice(-300)
-        });
+function cleanupUnique(uniqueId) {
+  try {
+    for (const f of fs.readdirSync(CACHE_DIR)) {
+      if (f.startsWith(uniqueId)) {
+        try { fs.unlinkSync(path.join(CACHE_DIR, f)); } catch {}
       }
-
-      // Count audio formats (skip storyboards)
-      const lines = stdout.split('\n');
-      const audioFormats = lines.filter(l => {
-        if (l.includes('storyboard') || l.includes('mhtml')) return false;
-        if (l.includes('RESOLUTION') || l.startsWith('---') || l.startsWith('ID')) return false;
-        // Match audio-only format rows
-        return /\b(audio|opus|mp4a|vorbis)\b/i.test(l) || /\b(251|250|249|140|139|599|600)\b/.test(l);
-      });
-
-      resolve({
-        ok: true,
-        audioFormatsFound: audioFormats.length,
-        sample: audioFormats.slice(0, 3),
-        totalLines: lines.length
-      });
-    });
-  });
+    }
+  } catch {}
 }
 
 // ==================== CLEANUP ====================
@@ -416,29 +420,18 @@ async function cleanupExpiredCache() {
     for (const f of fs.readdirSync(CACHE_DIR)) {
       if (f === 'cookies.txt') continue;
       const fp = path.join(CACHE_DIR, f);
-      const st = fs.statSync(fp);
-      if ((now - st.mtimeMs) > CACHE_TTL_MS) {
-        fs.unlinkSync(fp);
-        removed++;
-      }
+      try {
+        const st = fs.statSync(fp);
+        if ((now - st.mtimeMs) > CACHE_TTL_MS * 2) {
+          fs.unlinkSync(fp);
+          removed++;
+        }
+      } catch {}
     }
   } catch {}
 
-  let totalSize = 0;
-  for (const e of cacheMeta.values()) totalSize += e.size || 0;
-  if (totalSize > MAX_CACHE_SIZE) {
-    const sorted = [...cacheMeta.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt);
-    for (const [key, e] of sorted) {
-      if (totalSize <= MAX_CACHE_SIZE * 0.8) break;
-      try { fs.unlinkSync(e.filePath); totalSize -= e.size; } catch {}
-      cacheMeta.delete(key);
-      removed++;
-    }
-  }
-
-  if (removed) console.log(`🧹 Cleaned ${removed} files`);
+  if (removed) console.log(`🧹 Cleaned ${removed}`);
 }
-
 setInterval(cleanupExpiredCache, 10 * 60 * 1000);
 
 // ==================== HELPERS ====================
@@ -458,10 +451,8 @@ function formatSongItem(item) {
     duration: item.duration?.text || '0:00',
     durationSeconds: item.duration?.seconds || 0,
     thumbnail:
-      item.thumbnail?.contents?.[0]?.url ||
-      item.thumbnail?.[0]?.url ||
-      item.thumbnails?.[0]?.url ||
-      `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      item.thumbnail?.contents?.[0]?.url || item.thumbnail?.[0]?.url ||
+      item.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     url: `https://music.youtube.com/watch?v=${videoId}`
   };
 }
@@ -523,26 +514,6 @@ async function getHomePage() {
   return result.slice(0, 10);
 }
 
-async function getNewReleases() {
-  const yt = await getClient();
-  try {
-    const home = await yt.music.getHomeFeed();
-    const sections = home.sections || [];
-    const result = [];
-    for (const s of sections) {
-      const title = s.header?.title?.text || '';
-      const lower = title.toLowerCase();
-      if (lower.includes('new') || lower.includes('release') || lower.includes('fresh')) {
-        const items = (s.contents || []).slice(0, 15).map(formatSongItem).filter(Boolean);
-        if (items.length) result.push({ section: title, items });
-      }
-    }
-    return result;
-  } catch {
-    return [];
-  }
-}
-
 async function getLyrics(videoId) {
   const yt = await getClient();
   try {
@@ -558,7 +529,6 @@ async function getLyrics(videoId) {
       }).filter(l => l.text);
       return { available: true, synced: true, lines: parsed };
     }
-
     return {
       available: true, synced: false,
       lines: (lyrics.text || '').split('\n').filter(l => l.trim())
@@ -614,12 +584,10 @@ async function getPlaylistInfo(browseId, limit = 100) {
 
 // ==================== USER PLAYLISTS ====================
 const userPlaylists = new Map();
-
 function getUserPlaylists(userId = 'default') {
   if (!userPlaylists.has(userId)) userPlaylists.set(userId, new Map());
   return userPlaylists.get(userId);
 }
-
 function createPlaylist(userId, name) {
   const pls = getUserPlaylists(userId);
   const id = crypto.randomBytes(8).toString('hex');
@@ -630,16 +598,8 @@ function createPlaylist(userId, name) {
 
 // ==================== ROUTES ====================
 
-app.get('/health', (req, res) => {
-  let ytdlpOk = YTDLP === 'yt-dlp';
-  let ytdlpSize = 0;
-  try {
-    if (fs.existsSync(YTDLP)) {
-      ytdlpSize = fs.statSync(YTDLP).size;
-      ytdlpOk = ytdlpSize > 1000000;
-    }
-  } catch {}
-
+app.get('/health', async (req, res) => {
+  const ytdlpSize = fs.existsSync(YTDLP) ? fs.statSync(YTDLP).size : 0;
   let cookieCount = 0;
   if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
     try {
@@ -650,32 +610,92 @@ app.get('/health', (req, res) => {
 
   res.json({
     status: 'ok',
-    version: '3.4.0',
-    uptime: process.uptime(),
+    version: '3.7.0',
+    uptime: Math.round(process.uptime()),
     cache: cacheMeta.size,
     ytdlp: {
       path: YTDLP,
-      exists: fs.existsSync(YTDLP) || YTDLP === 'yt-dlp',
-      sizeMB: +(ytdlpSize / 1024 / 1024).toFixed(1),
-      ok: ytdlpOk
+      exists: fs.existsSync(YTDLP),
+      sizeMB: +(ytdlpSize / 1024 / 1024).toFixed(2),
+      ok: ytdlpSize > 15 * 1024 * 1024  // ⚠️ Real binary must be >15MB
     },
     cookies: {
       loaded: !!COOKIES_FILE,
-      path: COOKIES_FILE,
-      exists: COOKIES_FILE ? fs.existsSync(COOKIES_FILE) : false,
-      entries: cookieCount
-    },
-    clients: PLAYER_CLIENTS
+      entries: cookieCount,
+      ok: cookieCount > 20
+    }
   });
 });
 
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    name: '🎵 Echo Music API',
-    version: '3.4.0',
-    cache: { entries: cacheMeta.size, ttl: `${CACHE_TTL_MS / 60000} min` }
+// ⚡ Warmup — pre-init everything
+app.get('/api/warmup', async (req, res) => {
+  const start = Date.now();
+  try {
+    const yt = await getClient();
+    await yt.music.search('test', { type: 'song' });
+    res.json({ success: true, ms: Date.now() - start });
+  } catch (e) {
+    res.json({ success: false, error: e.message, ms: Date.now() - start });
+  }
+});
+
+// ⚡ Diagnostics
+app.get('/api/diagnose', async (req, res) => {
+  const diag = {
+    version: '3.7.0',
+    ytdlp: { path: YTDLP, exists: fs.existsSync(YTDLP) },
+    cookies: { loaded: !!COOKIES_FILE },
+    test: {}
+  };
+
+  if (fs.existsSync(YTDLP)) {
+    diag.ytdlp.sizeMB = +(fs.statSync(YTDLP).size / 1024 / 1024).toFixed(2);
+    diag.ytdlp.ok = diag.ytdlp.sizeMB > 15;
+  }
+
+  if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
+    diag.cookies.entries = fs.readFileSync(COOKIES_FILE, 'utf-8')
+      .split('\n').filter(l => l.trim() && !l.startsWith('#')).length;
+    diag.cookies.ok = diag.cookies.entries > 20;
+  }
+
+  // Test yt-dlp on a known video
+  try {
+    const result = await testVideo('dQw4w9WgXcQ');
+    diag.test = result;
+  } catch (e) {
+    diag.test = { error: e.message };
+  }
+
+  res.json(diag);
+});
+
+function testVideo(videoId) {
+  return new Promise((resolve) => {
+    const args = [
+      '--list-formats',
+      '--no-warnings',
+      '--no-check-certificates',
+      '--extractor-args', 'youtube:player_client=android_vr',
+      '--geo-bypass',
+      '--geo-bypass-country', 'IN'
+    ];
+    if (COOKIES_FILE) args.push('--cookies', COOKIES_FILE);
+    args.push(`https://www.youtube.com/watch?v=${videoId}`);
+
+    execFile(YTDLP, args, { timeout: 15000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        resolve({ ok: false, error: stderr?.slice(-300) || err.message });
+      } else {
+        const audio = stdout.split('\n').filter(l => /\b(251|250|249|140|139)\b/.test(l));
+        resolve({ ok: true, audioFormats: audio.length, sample: audio.slice(0, 2) });
+      }
+    });
   });
+}
+
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', name: '🎵 Echo Music API', version: '3.7.0' });
 });
 
 app.get('/api/qualities', (req, res) => {
@@ -687,48 +707,6 @@ app.get('/api/qualities', (req, res) => {
   });
 });
 
-app.get('/api/test-ytdlp', (req, res) => {
-  execFile(YTDLP, ['--version'], { timeout: 10000 }, (err, stdout, stderr) => {
-    if (err) {
-      return res.status(500).json({
-        ok: false, path: YTDLP, error: err.message,
-        exists: fs.existsSync(YTDLP)
-      });
-    }
-    res.json({
-      ok: true, version: stdout.trim(), path: YTDLP,
-      cookiesLoaded: !!COOKIES_FILE
-    });
-  });
-});
-
-// 🎯 Debug: Test all clients for a video
-app.get('/api/debug-formats/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  const results = {};
-
-  await Promise.all(PLAYER_CLIENTS.map(async (client) => {
-    try {
-      results[client] = await testClient(videoId, client);
-    } catch (e) {
-      results[client] = { ok: false, error: e.message };
-    }
-  }));
-
-  // Summary
-  const working = Object.entries(results)
-    .filter(([_, r]) => r.ok && r.audioFormatsFound > 0)
-    .map(([c]) => c);
-
-  res.json({
-    success: true,
-    videoId,
-    workingClients: working,
-    totalWorking: working.length,
-    results
-  });
-});
-
 // SEARCH
 app.get('/api/search', async (req, res) => {
   try {
@@ -736,10 +714,7 @@ app.get('/api/search', async (req, res) => {
     if (!q) return res.status(400).json({ error: 'q required' });
     const results = await searchMusic(q, parseInt(limit));
     res.json({ success: true, query: q, count: results.length, results });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/search/all', async (req, res) => {
@@ -747,9 +722,7 @@ app.get('/api/search/all', async (req, res) => {
     const { q } = req.query;
     if (!q) return res.status(400).json({ error: 'q required' });
     res.json({ success: true, query: q, ...(await searchAll(q)) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/home', async (req, res) => {
@@ -763,11 +736,6 @@ app.get('/api/trending', async (req, res) => {
     const results = await getTrending(region);
     res.json({ success: true, region, count: results.length, results });
   } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/new', async (req, res) => {
-  try { res.json({ success: true, sections: await getNewReleases() }); }
-  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/related/:videoId', async (req, res) => {
@@ -801,15 +769,12 @@ app.get('/api/playlist/:browseId', async (req, res) => {
 
 // STREAM INFO
 app.get('/api/stream-info/:videoId', async (req, res) => {
+  const start = Date.now();
   try {
     const { videoId } = req.params;
     const quality = req.query.quality || 'm4a-128';
-
     if (!QUALITY_MAP[quality]) {
-      return res.status(400).json({
-        error: 'Invalid quality',
-        valid: Object.keys(QUALITY_MAP)
-      });
+      return res.status(400).json({ error: 'Invalid quality', valid: Object.keys(QUALITY_MAP) });
     }
 
     const entry = await getOrCreateCache(videoId, quality);
@@ -823,30 +788,24 @@ app.get('/api/stream-info/:videoId', async (req, res) => {
       artist: entry.artist,
       duration: entry.duration,
       thumbnail: entry.thumbnail,
-      requestedQuality: quality,
-      actualFormat: {
-        ext: entry.ext,
-        mime: entry.mime,
-        size: entry.size,
-        client: entry.client
-      },
+      quality,
+      actualFormat: { ext: entry.ext, mime: entry.mime, size: entry.size, client: entry.client },
       streamUrl: `${proto}://${host}/api/stream/${videoId}?quality=${quality}`,
       downloadUrl: `${proto}://${host}/api/download/${videoId}?quality=${quality}`,
       fromCache: entry.fromCache,
-      expiresAt: new Date(entry.createdAt + CACHE_TTL_MS).toISOString()
+      expiresAt: new Date(entry.createdAt + CACHE_TTL_MS).toISOString(),
+      processingMs: Date.now() - start
     });
   } catch (err) {
-    console.error('stream-info error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('stream-info error:', err.message);
+    res.status(500).json({ error: err.message, processingMs: Date.now() - start });
   }
 });
 
-// STREAM
 app.get('/api/stream/:videoId', async (req, res) => {
   try {
     const { videoId } = req.params;
     const quality = req.query.quality || 'm4a-128';
-
     if (!QUALITY_MAP[quality]) return res.status(400).json({ error: 'Invalid quality' });
 
     const entry = await getOrCreateCache(videoId, quality);
@@ -858,8 +817,6 @@ app.get('/api/stream/:videoId', async (req, res) => {
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('X-Cache', entry.fromCache ? 'HIT' : 'MISS');
-    res.setHeader('X-Actual-Ext', entry.ext);
-    res.setHeader('X-Client', entry.client || 'cache');
 
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-');
@@ -874,12 +831,11 @@ app.get('/api/stream/:videoId', async (req, res) => {
       fs.createReadStream(entry.filePath).pipe(res);
     }
   } catch (err) {
-    console.error('stream error:', err);
+    console.error('stream error:', err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
-// DOWNLOAD
 app.get('/api/download/:videoId', async (req, res) => {
   try {
     const { videoId } = req.params;
@@ -894,11 +850,61 @@ app.get('/api/download/:videoId', async (req, res) => {
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('X-Cache', entry.fromCache ? 'HIT' : 'MISS');
-    res.setHeader('X-Actual-Ext', entry.ext);
     fs.createReadStream(entry.filePath).pipe(res);
   } catch (err) {
-    console.error('download error:', err);
+    console.error('download error:', err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// SMART STREAM
+app.get('/api/smart-stream', async (req, res) => {
+  const start = Date.now();
+  try {
+    const { q, quality = 'm4a-128' } = req.query;
+    if (!q) return res.status(400).json({ error: 'q required' });
+
+    const yt = await getClient();
+    const results = await yt.music.search(q, { type: 'song' });
+    const songs = (results.songs?.contents || []).slice(0, 5);
+    if (!songs.length) return res.status(404).json({ error: 'No songs found' });
+
+    const errors = [];
+    const songPromises = songs.map(async (song) => {
+      try {
+        const entry = await getOrCreateCache(song.id, quality);
+        return { song, entry };
+      } catch (err) {
+        errors.push({ videoId: song.id, error: err.message.slice(0, 80) });
+        return null;
+      }
+    });
+
+    const results2 = await Promise.all(songPromises);
+    const success = results2.find(r => r !== null);
+
+    if (!success) {
+      return res.status(404).json({ error: 'All failed', tried: errors.length, errors });
+    }
+
+    const host = req.get('host');
+    const proto = req.protocol;
+
+    res.json({
+      success: true,
+      videoId: success.song.id,
+      title: success.entry.title,
+      artist: success.entry.artist,
+      thumbnail: success.entry.thumbnail,
+      quality,
+      actualFormat: { ext: success.entry.ext, mime: success.entry.mime, size: success.entry.size, client: success.entry.client },
+      streamUrl: `${proto}://${host}/api/stream/${success.song.id}?quality=${quality}`,
+      downloadUrl: `${proto}://${host}/api/download/${success.song.id}?quality=${quality}`,
+      fromCache: success.entry.fromCache,
+      processingMs: Date.now() - start
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -941,7 +947,7 @@ app.delete('/api/user/playlists/:id', (req, res) => {
   res.json({ success: ok });
 });
 
-// CACHE ADMIN
+// CACHE
 app.get('/api/cache/stats', (req, res) => {
   let totalSize = 0;
   for (const e of cacheMeta.values()) totalSize += e.size || 0;
@@ -952,10 +958,8 @@ app.get('/api/cache/stats', (req, res) => {
     ttlMinutes: CACHE_TTL_MS / 60000,
     items: [...cacheMeta.entries()].map(([k, e]) => ({
       key: k, videoId: e.videoId, quality: e.quality, title: e.title,
-      ext: e.ext, mime: e.mime, client: e.client,
-      sizeMB: +(e.size / 1024 / 1024).toFixed(2),
-      ageMinutes: +((Date.now() - e.createdAt) / 60000).toFixed(1),
-      expiresIn: Math.max(0, Math.round((e.createdAt + CACHE_TTL_MS - Date.now()) / 60000))
+      ext: e.ext, client: e.client,
+      sizeMB: +(e.size / 1024 / 1024).toFixed(2)
     }))
   });
 });
@@ -969,29 +973,39 @@ app.post('/api/cache/clear', (req, res) => {
   res.json({ success: true, removed });
 });
 
-// ERROR HANDLER
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
   if (!res.headersSent) res.status(500).json({ error: err.message });
 });
 
-// START
-app.listen(PORT, '0.0.0.0', () => {
+// ==================== START ====================
+(async () => {
   console.log('');
   console.log('============================================');
-  console.log(`🎵 Echo Music API v3.4`);
-  console.log(`🌐 http://0.0.0.0:${PORT}`);
+  console.log(`🎵 Echo Music API v3.7 (Fast + Robust)`);
+  console.log(`🌐 Port: ${PORT}`);
   console.log(`📁 Cache: ${CACHE_DIR}`);
-  console.log(`🎬 yt-dlp: ${YTDLP}`);
   console.log(`🍪 Cookies: ${COOKIES_FILE || 'NONE ⚠️'}`);
-  console.log(`🎯 Clients: ${PLAYER_CLIENTS.length} (rotation)`);
-  console.log(`⏱️  TTL: ${CACHE_TTL_MS / 60000} min`);
+  console.log(`⚡ Parallel clients: ${PARALLEL_CLIENTS}`);
+  console.log(`⏱️  Client timeout: ${CLIENT_TIMEOUT_MS}ms`);
   console.log('============================================');
-});
+
+  // Verify yt-dlp
+  const check = await verifyYtdlp();
+  if (!check.ok) {
+    console.error('');
+    console.error('⚠️  yt-dlp is BROKEN — downloads will fail!');
+    console.error('⚠️  Fix: Change bin/ in .gitignore and redeploy');
+    console.error('');
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server listening on 0.0.0.0:${PORT}`);
+  });
+})();
 
 process.on('SIGTERM', () => {
   cleanupExpiredCache().finally(() => process.exit(0));
 });
-
 process.on('uncaughtException', (err) => console.error('Uncaught:', err));
 process.on('unhandledRejection', (err) => console.error('Unhandled:', err));
