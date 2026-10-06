@@ -1,60 +1,51 @@
 // scripts/install-ytdlp.js
-// Robust yt-dlp downloader for Render.com
+// Downloads proper yt-dlp standalone binary for Render
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { execSync } = require('child_process');
 
 const BIN_DIR = path.join(__dirname, '..', 'bin');
 const BIN_PATH = path.join(BIN_DIR, 'yt-dlp');
 
-function log(msg) { console.log(`[yt-dlp-installer] ${msg}`); }
-
-// Ensure bin dir
 if (!fs.existsSync(BIN_DIR)) fs.mkdirSync(BIN_DIR, { recursive: true });
 
-// If already valid, skip
+function log(msg) { console.log(`[yt-dlp-install] ${msg}`); }
+
+// Check if already valid (must be > 15 MB for real binary)
 if (fs.existsSync(BIN_PATH)) {
-  try {
-    const stats = fs.statSync(BIN_PATH);
-    if (stats.size > 1000000) {  // > 1MB = valid
-      log(`✅ Already installed (${(stats.size / 1024 / 1024).toFixed(1)} MB)`);
-      process.exit(0);
-    } else {
-      log(`⚠️  Existing binary too small (${stats.size} bytes), re-downloading...`);
-      fs.unlinkSync(BIN_PATH);
-    }
-  } catch (e) {
+  const size = fs.statSync(BIN_PATH).size;
+  if (size > 15 * 1024 * 1024) {
+    log(`✅ Already installed (${(size / 1024 / 1024).toFixed(1)} MB)`);
+    process.exit(0);
+  } else {
+    log(`⚠️  Existing binary too small (${(size / 1024 / 1024).toFixed(1)} MB) — removing`);
     fs.unlinkSync(BIN_PATH);
   }
 }
 
-log('⬇️  Downloading yt-dlp...');
-
+// ⚠️ IMPORTANT: use "yt-dlp_linux" (standalone Linux binary, ~30MB)
 const URLS = [
-  'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp',
-  'https://github.com/yt-dlp/yt-dlp/releases/download/2024.11.18/yt-dlp'
+  'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux',
+  'https://github.com/yt-dlp/yt-dlp/releases/download/2024.11.18/yt-dlp_linux'
 ];
 
-function downloadFollowRedirects(url, dest, maxRedirects = 5) {
+function download(url, dest, redirects = 5) {
   return new Promise((resolve, reject) => {
-    if (maxRedirects <= 0) return reject(new Error('Too many redirects'));
+    if (redirects <= 0) return reject(new Error('Too many redirects'));
 
     log(`Fetching: ${url}`);
-    const req = https.get(url, {
+
+    https.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; EchoMusicBot/1.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; EchoMusic/1.0)',
         'Accept': '*/*'
       },
-      timeout: 60000
+      timeout: 90000
     }, (res) => {
-      // Handle redirects
       if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
         res.resume();
-        const location = res.headers.location;
-        log(`→ Redirect ${res.statusCode} to: ${location}`);
-        return downloadFollowRedirects(location, dest, maxRedirects - 1)
+        return download(res.headers.location, dest, redirects - 1)
           .then(resolve).catch(reject);
       }
 
@@ -64,56 +55,39 @@ function downloadFollowRedirects(url, dest, maxRedirects = 5) {
       }
 
       const file = fs.createWriteStream(dest);
-      let downloaded = 0;
-
-      res.on('data', (chunk) => { downloaded += chunk.length; });
+      let size = 0;
+      res.on('data', (chunk) => { size += chunk.length; });
       res.pipe(file);
 
       file.on('finish', () => {
         file.close(() => {
-          log(`✅ Downloaded ${(downloaded / 1024 / 1024).toFixed(1)} MB`);
-          resolve();
+          log(`Downloaded ${(size / 1024 / 1024).toFixed(1)} MB`);
+          resolve(size);
         });
       });
-
-      file.on('error', (err) => {
-        fs.unlink(dest, () => {});
-        reject(err);
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Download timeout'));
+      file.on('error', reject);
+    }).on('error', reject).on('timeout', function() {
+      this.destroy();
+      reject(new Error('timeout'));
     });
   });
 }
 
-async function tryDownload() {
+(async () => {
   for (const url of URLS) {
     try {
-      await downloadFollowRedirects(url, BIN_PATH);
-      const size = fs.statSync(BIN_PATH).size;
-      if (size < 1000000) {
-        throw new Error(`File too small: ${size} bytes`);
+      const size = await download(url, BIN_PATH);
+      if (size < 15 * 1024 * 1024) {
+        throw new Error(`File too small: ${(size / 1024 / 1024).toFixed(1)} MB`);
       }
       fs.chmodSync(BIN_PATH, 0o755);
-      log(`✅ yt-dlp ready at ${BIN_PATH}`);
-      return true;
+      log(`✅ yt-dlp ready (${(size / 1024 / 1024).toFixed(1)} MB)`);
+      process.exit(0);
     } catch (e) {
-      log(`❌ Failed from ${url}: ${e.message}`);
+      log(`❌ Failed: ${e.message}`);
       try { fs.unlinkSync(BIN_PATH); } catch {}
     }
   }
-  return false;
-}
-
-(async () => {
-  const ok = await tryDownload();
-  if (!ok) {
-    log('⚠️  yt-dlp download failed. Server will try system yt-dlp at runtime.');
-    // Don't fail npm install
-  }
+  log('⚠️  All URLs failed, will try system yt-dlp at runtime');
   process.exit(0);
 })();
