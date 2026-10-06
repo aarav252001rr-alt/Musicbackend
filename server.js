@@ -1,5 +1,5 @@
 // ============================================================
-// 🎵 ECHO MUSIC BACKEND v3.2 — yt-dlp + Cookies Auth
+// 🎵 ECHO MUSIC BACKEND v3.3 — yt-dlp + Cookies + Smart Format
 // Deploy-ready for Render.com
 // ============================================================
 
@@ -32,7 +32,6 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 let COOKIES_FILE = null;
 
 function setupCookies() {
-  // ---- Option 1: Base64 env var (Render pe best) ----
   if (process.env.YTDLP_COOKIES_B64) {
     try {
       const cookiesPath = path.join(CACHE_DIR, 'cookies.txt');
@@ -47,7 +46,6 @@ function setupCookies() {
     }
   }
 
-  // ---- Option 2: COOKIES_FILE path env var (Render Secret Files) ----
   if (process.env.COOKIES_FILE && fs.existsSync(process.env.COOKIES_FILE)) {
     COOKIES_FILE = process.env.COOKIES_FILE;
     const count = fs.readFileSync(COOKIES_FILE, 'utf-8')
@@ -56,7 +54,6 @@ function setupCookies() {
     return;
   }
 
-  // ---- Option 3: Local ./cookies/cookies.txt ----
   const localCookies = path.join(__dirname, 'cookies', 'cookies.txt');
   if (fs.existsSync(localCookies)) {
     COOKIES_FILE = localCookies;
@@ -66,9 +63,7 @@ function setupCookies() {
     return;
   }
 
-  console.warn('⚠️  NO COOKIES FOUND');
-  console.warn('⚠️  YouTube will likely block with "Sign in to confirm" error');
-  console.warn('⚠️  Set YTDLP_COOKIES_B64 env var (see README)');
+  console.warn('⚠️  NO COOKIES FOUND — YouTube may block requests');
 }
 
 setupCookies();
@@ -102,7 +97,7 @@ app.use('/api/', rateLimit({
   message: { error: 'Too many requests. Slow down!' }
 }));
 
-// ==================== YOUTUBE CLIENT (metadata only) ====================
+// ==================== YOUTUBE CLIENT (metadata) ====================
 let ytClient = null;
 async function getClient() {
   if (!ytClient) {
@@ -116,23 +111,24 @@ async function getClient() {
   return ytClient;
 }
 
-// ==================== QUALITY MAP ====================
+// ==================== QUALITY MAP (with fallbacks) ====================
 const QUALITY_MAP = {
   'opus-160': {
     ext: 'opus', label: 'Opus 160kbps', bitrate: 160, mime: 'audio/webm',
-    ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio'
+    ytdlpFormat: 'bestaudio[acodec=opus][abr>=128]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio'
   },
   'opus-70': {
     ext: 'opus', label: 'Opus 70kbps', bitrate: 70, mime: 'audio/webm',
-    ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio'
+    ytdlpFormat: 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio'
   },
   'm4a-128': {
     ext: 'm4a', label: 'M4A 128kbps', bitrate: 128, mime: 'audio/mp4',
-    ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio'
+    // 🎯 Multiple fallbacks — M4A na mile toh OPUS use karega
+    ytdlpFormat: 'bestaudio[ext=m4a][abr>=96]/bestaudio[acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio'
   },
   'm4a-48': {
     ext: 'm4a', label: 'M4A 48kbps', bitrate: 48, mime: 'audio/mp4',
-    ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio'
+    ytdlpFormat: 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[acodec=opus]/bestaudio'
   },
 };
 
@@ -182,7 +178,7 @@ async function getOrCreateCache(videoId, quality) {
   return promise;
 }
 
-// ==================== yt-dlp DOWNLOAD ====================
+// ==================== yt-dlp DOWNLOAD (Smart Fallback) ====================
 function downloadWithYtdlp(videoId, quality) {
   return new Promise((resolve, reject) => {
     const q = QUALITY_MAP[quality];
@@ -203,7 +199,6 @@ function downloadWithYtdlp(videoId, quality) {
       '-o', tempTemplate,
       '--print-json',
       '--quiet',
-      // 🎯 Multi-client — bot detection bypass
       '--extractor-args', 'youtube:player_client=web,mweb,android,ios,tv_embedded,web_safari',
       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       '--add-header', 'Accept-Language:en-US,en;q=0.9',
@@ -214,7 +209,6 @@ function downloadWithYtdlp(videoId, quality) {
       '--fragment-retries', '5'
     ];
 
-    // 🎯 Cookies — MOST IMPORTANT
     if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
       args.push('--cookies', COOKIES_FILE);
     }
@@ -247,6 +241,7 @@ function downloadWithYtdlp(videoId, quality) {
         return reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-300)}`));
       }
 
+      // Find downloaded file
       let actualFile = null;
       try {
         const files = fs.readdirSync(CACHE_DIR);
@@ -254,6 +249,7 @@ function downloadWithYtdlp(videoId, quality) {
           f.startsWith(`${videoId}_${quality}`)
           && !f.endsWith('.txt')
           && !f.endsWith('.json')
+          && !f.endsWith('.part')
         );
         if (match) actualFile = path.join(CACHE_DIR, match);
       } catch (e) {
@@ -284,11 +280,16 @@ function downloadWithYtdlp(videoId, quality) {
         console.warn('Failed to parse yt-dlp JSON:', e.message);
       }
 
-      const actualExt = path.extname(finalPath).replace('.', '') || q.ext;
-      const mime = (actualExt === 'opus' || actualExt === 'webm') ? 'audio/webm' : 'audio/mp4';
+      // 🎯 Actual ext detect karo — file path se (fallback handled)
+      const actualExt = path.extname(finalPath).replace('.', '').toLowerCase() || q.ext;
+      const isWebm = actualExt === 'opus' || actualExt === 'webm';
+      const mime = isWebm ? 'audio/webm' : 'audio/mp4';
+
+      console.log(`✅ Downloaded: ${actualExt} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
 
       resolve({
-        videoId, quality,
+        videoId,
+        quality,
         filePath: finalPath,
         createdAt: Date.now(),
         size: stats.size,
@@ -296,7 +297,8 @@ function downloadWithYtdlp(videoId, quality) {
         artist: meta.uploader || meta.channel || 'Unknown',
         duration: meta.duration || 0,
         thumbnail: meta.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-        mime, ext: actualExt
+        mime,
+        ext: actualExt
       });
     });
 
@@ -324,7 +326,7 @@ async function cleanupExpiredCache() {
 
   try {
     for (const f of fs.readdirSync(CACHE_DIR)) {
-      if (f === 'cookies.txt') continue; // 🍪 Cookies ko mat delete karo!
+      if (f === 'cookies.txt') continue; // 🍪 Cookies safe rakho
       const fp = path.join(CACHE_DIR, f);
       const st = fs.statSync(fp);
       if ((now - st.mtimeMs) > CACHE_TTL_MS) {
@@ -560,6 +562,7 @@ app.get('/health', (req, res) => {
 
   res.json({
     status: 'ok',
+    version: '3.3.0',
     uptime: process.uptime(),
     cache: cacheMeta.size,
     ytdlp: {
@@ -581,8 +584,26 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     name: '🎵 Echo Music API',
-    version: '3.2.0',
-    cache: { entries: cacheMeta.size, ttl: `${CACHE_TTL_MS / 60000} min` }
+    version: '3.3.0',
+    cache: { entries: cacheMeta.size, ttl: `${CACHE_TTL_MS / 60000} min` },
+    endpoints: {
+      search: 'GET /api/search?q=song&limit=20',
+      searchAll: 'GET /api/search/all?q=song',
+      home: 'GET /api/home',
+      trending: 'GET /api/trending?region=IN',
+      newReleases: 'GET /api/new',
+      related: 'GET /api/related/:videoId',
+      lyrics: 'GET /api/lyrics/:videoId',
+      artist: 'GET /api/artist/:browseId',
+      album: 'GET /api/album/:browseId',
+      playlistInfo: 'GET /api/playlist/:browseId',
+      streamInfo: 'GET /api/stream-info/:videoId?quality=m4a-128',
+      stream: 'GET /api/stream/:videoId?quality=m4a-128',
+      download: 'GET /api/download/:videoId?quality=m4a-128',
+      qualities: 'GET /api/qualities',
+      debugFormats: 'GET /api/debug-formats/:videoId',
+      cacheStats: 'GET /api/cache/stats'
+    }
   });
 });
 
@@ -601,15 +622,38 @@ app.get('/api/test-ytdlp', (req, res) => {
       return res.status(500).json({
         ok: false, path: YTDLP, error: err.message,
         stderr: stderr?.slice(-300),
-        exists: fs.existsSync(YTDLP),
-        sizeMB: fs.existsSync(YTDLP) ? +(fs.statSync(YTDLP).size / 1024 / 1024).toFixed(1) : 0
+        exists: fs.existsSync(YTDLP)
       });
     }
     res.json({
       ok: true, version: stdout.trim(), path: YTDLP,
-      sizeMB: fs.existsSync(YTDLP) ? +(fs.statSync(YTDLP).size / 1024 / 1024).toFixed(1) : 0,
       cookiesLoaded: !!COOKIES_FILE
     });
+  });
+});
+
+// 🎯 Debug: List all available formats for a video
+app.get('/api/debug-formats/:videoId', (req, res) => {
+  const { videoId } = req.params;
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const args = [
+    '--list-formats',
+    '--no-warnings',
+    '--no-check-certificates',
+    '--extractor-args', 'youtube:player_client=web,mweb,android,ios,tv_embedded,web_safari',
+    '--geo-bypass',
+    '--geo-bypass-country', 'IN'
+  ];
+  if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
+    args.push('--cookies', COOKIES_FILE);
+  }
+  args.push(videoUrl);
+
+  execFile(YTDLP, args, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({ error: err.message, stderr: stderr?.slice(-500) });
+    }
+    res.json({ success: true, videoId, raw: stdout });
   });
 });
 
@@ -683,7 +727,7 @@ app.get('/api/playlist/:browseId', async (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// STREAM
+// STREAM INFO
 app.get('/api/stream-info/:videoId', async (req, res) => {
   try {
     const { videoId } = req.params;
@@ -707,10 +751,11 @@ app.get('/api/stream-info/:videoId', async (req, res) => {
       artist: entry.artist,
       duration: entry.duration,
       thumbnail: entry.thumbnail,
-      quality,
-      format: {
-        ext: entry.ext, mime: entry.mime, size: entry.size,
-        bitrate: QUALITY_MAP[quality].bitrate
+      requestedQuality: quality,
+      actualFormat: {
+        ext: entry.ext,
+        mime: entry.mime,
+        size: entry.size
       },
       streamUrl: `${proto}://${host}/api/stream/${videoId}?quality=${quality}`,
       downloadUrl: `${proto}://${host}/api/download/${videoId}?quality=${quality}`,
@@ -723,6 +768,7 @@ app.get('/api/stream-info/:videoId', async (req, res) => {
   }
 });
 
+// STREAM
 app.get('/api/stream/:videoId', async (req, res) => {
   try {
     const { videoId } = req.params;
@@ -739,6 +785,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('X-Cache', entry.fromCache ? 'HIT' : 'MISS');
+    res.setHeader('X-Actual-Ext', entry.ext);
 
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-');
@@ -758,6 +805,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
   }
 });
 
+// DOWNLOAD
 app.get('/api/download/:videoId', async (req, res) => {
   try {
     const { videoId } = req.params;
@@ -772,6 +820,7 @@ app.get('/api/download/:videoId', async (req, res) => {
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('X-Cache', entry.fromCache ? 'HIT' : 'MISS');
+    res.setHeader('X-Actual-Ext', entry.ext);
     fs.createReadStream(entry.filePath).pipe(res);
   } catch (err) {
     console.error('download error:', err);
@@ -829,6 +878,7 @@ app.get('/api/cache/stats', (req, res) => {
     ttlMinutes: CACHE_TTL_MS / 60000,
     items: [...cacheMeta.entries()].map(([k, e]) => ({
       key: k, videoId: e.videoId, quality: e.quality, title: e.title,
+      ext: e.ext, mime: e.mime,
       sizeMB: +(e.size / 1024 / 1024).toFixed(2),
       ageMinutes: +((Date.now() - e.createdAt) / 60000).toFixed(1),
       expiresIn: Math.max(0, Math.round((e.createdAt + CACHE_TTL_MS - Date.now()) / 60000))
@@ -855,7 +905,7 @@ app.use((err, req, res, next) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('============================================');
-  console.log(`🎵 Echo Music API v3.2`);
+  console.log(`🎵 Echo Music API v3.3`);
   console.log(`🌐 http://0.0.0.0:${PORT}`);
   console.log(`📁 Cache: ${CACHE_DIR}`);
   console.log(`🎬 yt-dlp: ${YTDLP}`);
